@@ -1,284 +1,904 @@
-import os
-import torch
-from transformers import pipeline
-import time
-import traceback
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-import uvicorn
-import nest_asyncio
-from pyngrok import ngrok
-
-# --- 設定 ---
-# モデル名を設定
-MODEL_NAME = "google/gemma-2-2b-jpn-it"  # お好みのモデルに変更可能です
-print(f"モデル名を設定: {MODEL_NAME}")
-
-# --- モデル設定クラス ---
-class Config:
-    def __init__(self, model_name=MODEL_NAME):
-        self.MODEL_NAME = model_name
-
-config = Config(MODEL_NAME)
-
-# --- FastAPIアプリケーション定義 ---
-app = FastAPI(
-    title="ローカルLLM APIサービス",
-    description="transformersモデルを使用したテキスト生成のためのAPI",
-    version="1.0.0"
-)
-
-# CORSミドルウェアを追加
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- データモデル定義 ---
-class Message(BaseModel):
-    role: str
-    content: str
-
-# 直接プロンプトを使用した簡略化されたリクエスト
-class SimpleGenerationRequest(BaseModel):
-    prompt: str
-    max_new_tokens: Optional[int] = 512
-    do_sample: Optional[bool] = True
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
-
-class GenerationResponse(BaseModel):
-    generated_text: str
-    response_time: float
-
-# --- モデル関連の関数 ---
-# モデルのグローバル変数
-model = None
-
-def load_model():
-    """推論用のLLMモデルを読み込む"""
-    global model  # グローバル変数を更新するために必要
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"使用デバイス: {device}")
-        pipe = pipeline(
-            "text-generation",
-            model=config.MODEL_NAME,
-            model_kwargs={"torch_dtype": torch.bfloat16},
-            device=device
-        )
-        print(f"モデル '{config.MODEL_NAME}' の読み込みに成功しました")
-        model = pipe  # グローバル変数を更新
-        return pipe
-    except Exception as e:
-        error_msg = f"モデル '{config.MODEL_NAME}' の読み込みに失敗: {e}"
-        print(error_msg)
-        traceback.print_exc()  # 詳細なエラー情報を出力
-        return None
-
-def extract_assistant_response(outputs, user_prompt):
-    """モデルの出力からアシスタントの応答を抽出する"""
-    assistant_response = ""
-    try:
-        if outputs and isinstance(outputs, list) and len(outputs) > 0 and outputs[0].get("generated_text"):
-            generated_output = outputs[0]["generated_text"]
-            
-            if isinstance(generated_output, list):
-                # メッセージフォーマットの場合
-                if len(generated_output) > 0:
-                    last_message = generated_output[-1]
-                    if isinstance(last_message, dict) and last_message.get("role") == "assistant":
-                        assistant_response = last_message.get("content", "").strip()
-                    else:
-                        # 予期しないリスト形式の場合は最後の要素を文字列として試行
-                        print(f"警告: 最後のメッセージの形式が予期しないリスト形式です: {last_message}")
-                        assistant_response = str(last_message).strip()
-
-            elif isinstance(generated_output, str):
-                # 文字列形式の場合
-                full_text = generated_output
-                
-                # 単純なプロンプト入力の場合、プロンプト後の全てを抽出
-                if user_prompt:
-                    prompt_end_index = full_text.find(user_prompt)
-                    if prompt_end_index != -1:
-                        prompt_end_pos = prompt_end_index + len(user_prompt)
-                        assistant_response = full_text[prompt_end_pos:].strip()
-                    else:
-                        # 元のプロンプトが見つからない場合は、生成されたテキストをそのまま返す
-                        assistant_response = full_text
-                else:
-                    assistant_response = full_text
-            else:
-                print(f"警告: 予期しない出力タイプ: {type(generated_output)}")
-                assistant_response = str(generated_output).strip()  # 文字列に変換
-
-    except Exception as e:
-        print(f"応答の抽出中にエラーが発生しました: {e}")
-        traceback.print_exc()
-        assistant_response = "応答の抽出に失敗しました。"  # エラーメッセージを設定
-
-    if not assistant_response:
-        print("警告: アシスタントの応答を抽出できませんでした。完全な出力:", outputs)
-        # デフォルトまたはエラー応答を返す
-        assistant_response = "応答を生成できませんでした。"
-
-    return assistant_response
-
-# --- FastAPIエンドポイント定義 ---
-@app.on_event("startup")
-async def startup_event():
-    """起動時にモデルを初期化"""
-    load_model_task()  # バックグラウンドではなく同期的に読み込む
-    if model is None:
-        print("警告: 起動時にモデルの初期化に失敗しました")
-    else:
-        print("起動時にモデルの初期化が完了しました。")
-
-@app.get("/")
-async def root():
-    """基本的なAPIチェック用のルートエンドポイント"""
-    return {"status": "ok", "message": "Local LLM API is runnning"}
-
-@app.get("/health")
-async def health_check():
-    """ヘルスチェックエンドポイント"""
-    global model
-    if model is None:
-        return {"status": "error", "message": "No model loaded"}
-
-    return {"status": "ok", "model": config.MODEL_NAME}
-
-# 簡略化されたエンドポイント
-@app.post("/generate", response_model=GenerationResponse)
-async def generate_simple(request: SimpleGenerationRequest):
-    """単純なプロンプト入力に基づいてテキストを生成"""
-    global model
-
-    if model is None:
-        print("generateエンドポイント: モデルが読み込まれていません。読み込みを試みます...")
-        load_model_task()  # 再度読み込みを試みる
-        if model is None:
-            print("generateエンドポイント: モデルの読み込みに失敗しました。")
-            raise HTTPException(status_code=503, detail="モデルが利用できません。後でもう一度お試しください。")
-
-    try:
-        start_time = time.time()
-        print(f"シンプルなリクエストを受信: prompt={request.prompt[:100]}..., max_new_tokens={request.max_new_tokens}")  # 長いプロンプトは切り捨て
-
-        # プロンプトテキストで直接応答を生成
-        print("モデル推論を開始...")
-        outputs = model(
-            request.prompt,
-            max_new_tokens=request.max_new_tokens,
-            do_sample=request.do_sample,
-            temperature=request.temperature,
-            top_p=request.top_p,
-        )
-        print("モデル推論が完了しました。")
-
-        # アシスタント応答を抽出
-        assistant_response = extract_assistant_response(outputs, request.prompt)
-        print(f"抽出されたアシスタント応答: {assistant_response[:100]}...")  # 長い場合は切り捨て
-
-        end_time = time.time()
-        response_time = end_time - start_time
-        print(f"応答生成時間: {response_time:.2f}秒")
-
-        return GenerationResponse(
-            generated_text=assistant_response,
-            response_time=response_time
-        )
-
-    except Exception as e:
-        print(f"シンプル応答生成中にエラーが発生しました: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"応答の生成中にエラーが発生しました: {str(e)}")
-
-def load_model_task():
-    """モデルを読み込むバックグラウンドタスク"""
-    global model
-    print("load_model_task: モデルの読み込みを開始...")
-    # load_model関数を呼び出し、結果をグローバル変数に設定
-    loaded_pipe = load_model()
-    if loaded_pipe:
-        model = loaded_pipe  # グローバル変数を更新
-        print("load_model_task: モデルの読み込みが完了しました。")
-    else:
-        print("load_model_task: モデルの読み込みに失敗しました。")
-
-print("FastAPIエンドポイントを定義しました。")
-
-# --- ngrokでAPIサーバーを実行する関数 ---
-def run_with_ngrok(port=8501):
-    """ngrokでFastAPIアプリを実行"""
-    nest_asyncio.apply()
-
-    ngrok_token = os.environ.get("NGROK_TOKEN")
-    if not ngrok_token:
-        print("Ngrok認証トークンが'NGROK_TOKEN'環境変数に設定されていません。")
-        try:
-            print("Colab Secrets(左側の鍵アイコン)で'NGROK_TOKEN'を設定することをお勧めします。")
-            ngrok_token = input("Ngrok認証トークンを入力してください (https://dashboard.ngrok.com/get-started/your-authtoken): ")
-        except EOFError:
-            print("\nエラー: 対話型入力が利用できません。")
-            print("Colab Secretsを使用するか、ノートブックセルで`os.environ['NGROK_TOKEN'] = 'あなたのトークン'`でトークンを設定してください")
-            return
-
-    if not ngrok_token:
-        print("エラー: Ngrok認証トークンを取得できませんでした。中止します。")
-        return
-
-    try:
-        ngrok.set_auth_token(ngrok_token)
-
-        # 既存のngrokトンネルを閉じる
-        try:
-            tunnels = ngrok.get_tunnels()
-            if tunnels:
-                print(f"{len(tunnels)}個の既存トンネルが見つかりました。閉じています...")
-                for tunnel in tunnels:
-                    print(f"  - 切断中: {tunnel.public_url}")
-                    ngrok.disconnect(tunnel.public_url)
-                print("すべての既存ngrokトンネルを切断しました。")
-            else:
-                print("アクティブなngrokトンネルはありません。")
-        except Exception as e:
-            print(f"トンネル切断中にエラーが発生しました: {e}")
-            # エラーにもかかわらず続行を試みる
-
-        # 新しいngrokトンネルを開く
-        print(f"ポート{port}に新しいngrokトンネルを開いています...")
-        ngrok_tunnel = ngrok.connect(port)
-        public_url = ngrok_tunnel.public_url
-        print("---------------------------------------------------------------------")
-        print(f"✅ 公開URL:   {public_url}")
-        print(f"📖 APIドキュメント (Swagger UI): {public_url}/docs")
-        print("---------------------------------------------------------------------")
-        print("(APIクライアントやブラウザからアクセスするためにこのURLをコピーしてください)")
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")  # ログレベルをinfoに設定
-
-    except Exception as e:
-        print(f"\n ngrokまたはUvicornの起動中にエラーが発生しました: {e}")
-        traceback.print_exc()
-        # エラー後に残る可能性のあるngrokトンネルを閉じようとする
-        try:
-            print("エラーにより残っている可能性のあるngrokトンネルを閉じています...")
-            tunnels = ngrok.get_tunnels()
-            for tunnel in tunnels:
-                ngrok.disconnect(tunnel.public_url)
-            print("ngrokトンネルを閉じました。")
-        except Exception as ne:
-            print(f"ngrokトンネルのクリーンアップ中に別のエラーが発生しました: {ne}")
-
-# --- メイン実行ブロック ---
-if __name__ == "__main__":
-    # 指定されたポートでサーバーを起動
-    run_with_ngrok(port=8501)  # このポート番号を確認
-    # run_with_ngrokが終了したときにメッセージを表示
-    print("\nサーバープロセスが終了しました。")
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "gSpnWBP5ELSI"
+      },
+      "source": [
+        "# 実践演習 Day 1：streamlitとFastAPIのデモ\n",
+        "このノートブックでは以下の内容を学習します。\n",
+        "\n",
+        "- 必要なライブラリのインストールと環境設定\n",
+        "- Hugging Faceからモデルを用いたStreamlitのデモアプリ\n",
+        "- FastAPIとngrokを使用したAPIの公開方法\n",
+        "\n",
+        "演習を始める前に、HuggingFaceとngrokのアカウントを作成し、\n",
+        "それぞれのAPIトークンを取得する必要があります。\n",
+        "\n",
+        "\n",
+        "演習の時間では、以下の3つのディレクトリを順に説明します。\n",
+        "\n",
+        "1. 01_streamlit_UI\n",
+        "2. 02_streamlit_app\n",
+        "3. 03_FastAPI\n",
+        "\n",
+        "2つ目や3つ目からでも始められる様にノートブックを作成しています。\n",
+        "\n",
+        "復習の際にもこのノートブックを役立てていただければと思います。\n",
+        "\n",
+        "### 注意事項\n",
+        "「02_streamlit_app」と「03_FastAPI」では、GPUを使用します。\n",
+        "\n",
+        "これらを実行する際は、Google Colab画面上のメニューから「編集」→ 「ノートブックの設定」\n",
+        "\n",
+        "「ハードウェアアクセラレーター」の項目の中から、「T4 GPU」を選択してください。\n",
+        "\n",
+        "このノートブックのデフォルトは「CPU」になっています。\n",
+        "\n",
+        "---"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "OhtHkJOgELSL"
+      },
+      "source": [
+        "# 環境変数の設定（1~3共有）\n"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "Y-FjBp4MMQHM"
+      },
+      "source": [
+        "GitHubから演習用のコードをCloneします。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 1,
+      "metadata": {
+        "id": "AIXMavdDEP8U",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "1d767c38-476c-4c52-e74c-81caeb9c4d08"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Cloning into 'lecture-ai-engineering'...\n",
+            "remote: Enumerating objects: 41, done.\u001b[K\n",
+            "remote: Counting objects: 100% (32/32), done.\u001b[K\n",
+            "remote: Compressing objects: 100% (27/27), done.\u001b[K\n",
+            "remote: Total 41 (delta 7), reused 5 (delta 5), pack-reused 9 (from 1)\u001b[K\n",
+            "Receiving objects: 100% (41/41), 34.04 KiB | 590.00 KiB/s, done.\n",
+            "Resolving deltas: 100% (7/7), done.\n"
+          ]
+        }
+      ],
+      "source": [
+        "!git clone https://github.com/shixxtaxx/lecture-ai-engineering.git"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "XC8n7yZ_vs1K"
+      },
+      "source": [
+        "必要なAPIトークンを.envに設定します。\n",
+        "\n",
+        "「lecture-ai-engineering/day1」の配下に、「.env_template」ファイルが存在しています。\n",
+        "\n",
+        "隠しファイルのため表示されていない場合は、画面左側のある、目のアイコンの「隠しファイルの表示」ボタンを押してください。\n",
+        "\n",
+        "「.env_template」のファイル名を「.env」に変更します。「.env」ファイルを開くと、以下のような中身になっています。\n",
+        "\n",
+        "\n",
+        "```\n",
+        "HUGGINGFACE_TOKEN=\"hf-********\"\n",
+        "NGROK_TOKEN=\"********\"\n",
+        "```\n",
+        "ダブルクオーテーションで囲まれた文字列をHuggingfaceのアクセストークンと、ngrokの認証トークンで書き変えてください。\n",
+        "\n",
+        "それぞれのアカウントが作成済みであれば、以下のURLからそれぞれのトークンを取得できます。\n",
+        "\n",
+        "- Huggingfaceのアクセストークン\n",
+        "https://huggingface.co/docs/hub/security-tokens\n",
+        "\n",
+        "- ngrokの認証トークン\n",
+        "https://dashboard.ngrok.com/get-started/your-authtoken\n",
+        "\n",
+        "書き換えたら、「.env」ファイルをローカルのPCにダウンロードしてください。\n",
+        "\n",
+        "「01_streamlit_UI」から「02_streamlit_app」へ進む際に、CPUからGPUの利用に切り替えるため、セッションが一度切れてしまいます。\n",
+        "\n",
+        "その際に、トークンを設定した「.env」ファイルは再作成することになるので、その手間を減らすために「.env」ファイルをダウンロードしておくと良いです。"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "Py1BFS5RqcSS"
+      },
+      "source": [
+        "「.env」ファイルを読み込み、環境変数として設定します。次のセルを実行し、最終的に「True」が表示されていればうまく読み込めています。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 2,
+      "metadata": {
+        "id": "bvEowFfg5lrq",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "41d32395-e206-4bf4-fd64-3ad5fe9f5185"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Collecting python-dotenv\n",
+            "  Downloading python_dotenv-1.1.0-py3-none-any.whl.metadata (24 kB)\n",
+            "Downloading python_dotenv-1.1.0-py3-none-any.whl (20 kB)\n",
+            "Installing collected packages: python-dotenv\n",
+            "Successfully installed python-dotenv-1.1.0\n",
+            "/content/lecture-ai-engineering/day1\n"
+          ]
+        },
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "True"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 2
+        }
+      ],
+      "source": [
+        "!pip install python-dotenv\n",
+        "from dotenv import load_dotenv, find_dotenv\n",
+        "\n",
+        "%cd /content/lecture-ai-engineering/day1\n",
+        "load_dotenv(find_dotenv())"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "os0Yk6gaELSM"
+      },
+      "source": [
+        "# 01_streamlit_UI\n",
+        "\n",
+        "ディレクトリ「01_streamlit_UI」に移動します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 3,
+      "metadata": {
+        "id": "S28XgOm0ELSM",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "2d895f4c-6df0-4ce5-cd4a-1c7aee900b61"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "/content/lecture-ai-engineering/day1/01_streamlit_UI\n"
+          ]
+        }
+      ],
+      "source": [
+        "%cd /content/lecture-ai-engineering/day1/01_streamlit_UI"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "eVp-aEIkELSM"
+      },
+      "source": [
+        "必要なライブラリをインストールします。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 5,
+      "metadata": {
+        "id": "nBe41LFiELSN"
+      },
+      "outputs": [],
+      "source": [
+        "%%capture\n",
+        "!pip install -r requirements.txt"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "Yyw6VHaTELSN"
+      },
+      "source": [
+        "ngrokのトークンを使用して、認証を行います。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 6,
+      "metadata": {
+        "id": "aYw1q0iXELSN",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "d022f989-8685-4573-807c-5cde640b08a0"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Authtoken saved to configuration file: /root/.config/ngrok/ngrok.yml\n"
+          ]
+        }
+      ],
+      "source": [
+        "!ngrok authtoken $$NGROK_TOKEN"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "RssTcD_IELSN"
+      },
+      "source": [
+        "アプリを起動します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 10,
+      "metadata": {
+        "id": "f-E7ucR6ELSN",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "2b944799-4e25-49fc-ea2c-668c233e397c"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "公開URL: https://6304-34-125-242-248.ngrok-free.app\n",
+            "\n",
+            "Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.\n",
+            "\u001b[0m\n",
+            "\u001b[0m\n",
+            "\u001b[34m\u001b[1m  You can now view your Streamlit app in your browser.\u001b[0m\n",
+            "\u001b[0m\n",
+            "\u001b[34m  Local URL: \u001b[0m\u001b[1mhttp://localhost:8501\u001b[0m\n",
+            "\u001b[34m  Network URL: \u001b[0m\u001b[1mhttp://172.28.0.12:8501\u001b[0m\n",
+            "\u001b[34m  External URL: \u001b[0m\u001b[1mhttp://34.125.242.248:8501\u001b[0m\n",
+            "\u001b[0m\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "WARNING:pyngrok.process.ngrok:t=2025-04-22T17:08:04+0000 lvl=warn msg=\"failed to check for update\" obj=updater err=\"Post \\\"https://update.equinox.io/check\\\": context deadline exceeded\"\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\u001b[34m  Stopping...\u001b[0m\n",
+            "\u001b[34m  Stopping...\u001b[0m\n",
+            "Exception ignored in atexit callback: <function shutdown at 0x7fc0d8879440>\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/usr/lib/python3.11/logging/__init__.py\", line 2194, in shutdown\n",
+            "    h.release()\n",
+            "  File \"/usr/lib/python3.11/logging/__init__.py\", line 929, in release\n",
+            "    def release(self):\n",
+            "\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/streamlit/web/bootstrap.py\", line 44, in signal_handler\n",
+            "    server.stop()\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/streamlit/web/server/server.py\", line 470, in stop\n",
+            "    self._runtime.stop()\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/streamlit/runtime/runtime.py\", line 337, in stop\n",
+            "    async_objs.eventloop.call_soon_threadsafe(stop_on_eventloop)\n",
+            "  File \"/usr/lib/python3.11/asyncio/base_events.py\", line 807, in call_soon_threadsafe\n",
+            "    self._check_closed()\n",
+            "  File \"/usr/lib/python3.11/asyncio/base_events.py\", line 520, in _check_closed\n",
+            "    raise RuntimeError('Event loop is closed')\n",
+            "RuntimeError: Event loop is closed\n"
+          ]
+        }
+      ],
+      "source": [
+        "from pyngrok import ngrok\n",
+        "\n",
+        "public_url = ngrok.connect(8501).public_url\n",
+        "print(f\"公開URL: {public_url}\")\n",
+        "!streamlit run app.py"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "kbYyXVFjELSN"
+      },
+      "source": [
+        "公開URLの後に記載されているURLにブラウザでアクセスすると、streamlitのUIが表示されます。\n",
+        "\n",
+        "app.pyのコメントアウトされている箇所を編集することで、UIがどの様に変化するか確認してみましょう。\n",
+        "\n",
+        "streamlitの公式ページには、ギャラリーページがあります。\n",
+        "\n",
+        "streamlitを使うとpythonという一つの言語であっても、様々なUIを実現できることがわかると思います。\n",
+        "\n",
+        "https://streamlit.io/gallery"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "MmtP5GLOELSN"
+      },
+      "source": [
+        "後片付けとして、使う必要のないngrokのトンネルを削除します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 11,
+      "metadata": {
+        "id": "8Ek9QgahELSO"
+      },
+      "outputs": [],
+      "source": [
+        "from pyngrok import ngrok\n",
+        "ngrok.kill()"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "o-T8tFpyELSO"
+      },
+      "source": [
+        "# 02_streamlit_app"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "QqogFQKnELSO"
+      },
+      "source": [
+        "\n",
+        "ディレクトリ「02_streamlit_app」に移動します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 12,
+      "metadata": {
+        "id": "UeEjlJ7uELSO",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "5383f183-7dd6-4b34-c548-81332726c7e2"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "/content/lecture-ai-engineering/day1/02_streamlit_app\n"
+          ]
+        }
+      ],
+      "source": [
+        "%cd /content/lecture-ai-engineering/day1/02_streamlit_app"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "-XUH2AstELSO"
+      },
+      "source": [
+        "必要なライブラリをインストールします。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 14,
+      "metadata": {
+        "id": "mDqvI4V3ELSO"
+      },
+      "outputs": [],
+      "source": [
+        "%%capture\n",
+        "!pip install -r requirements.txt"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "ZO31umGZELSO"
+      },
+      "source": [
+        "ngrokとhuggigfaceのトークンを使用して、認証を行います。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 15,
+      "metadata": {
+        "id": "jPxTiEWQELSO",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "abf11e44-64eb-4f1d-f20e-bb157e783457"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Authtoken saved to configuration file: /root/.config/ngrok/ngrok.yml\n",
+            "The token has not been saved to the git credentials helper. Pass `add_to_git_credential=True` in this function directly or `--add-to-git-credential` if using via `huggingface-cli` if you want to set the git credential as well.\n",
+            "Token is valid (permission: write).\n",
+            "The token `ai_engeneering` has been saved to /root/.cache/huggingface/stored_tokens\n",
+            "Your token has been saved to /root/.cache/huggingface/token\n",
+            "Login successful.\n",
+            "The current active token is: `ai_engeneering`\n"
+          ]
+        }
+      ],
+      "source": [
+        "!ngrok authtoken $$NGROK_TOKEN\n",
+        "!huggingface-cli login --token $$HUGGINGFACE_TOKEN"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "dz4WrELLELSP"
+      },
+      "source": [
+        "stramlitでHuggingfaceのトークン情報を扱うために、streamlit用の設定ファイル（.streamlit）を作成し、トークンの情報を格納します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 16,
+      "metadata": {
+        "id": "W184-a7qFP0W"
+      },
+      "outputs": [],
+      "source": [
+        "# .streamlit/secrets.toml ファイルを作成\n",
+        "import os\n",
+        "import toml\n",
+        "\n",
+        "# 設定ファイルのディレクトリ確保\n",
+        "os.makedirs('.streamlit', exist_ok=True)\n",
+        "\n",
+        "# 環境変数から取得したトークンを設定ファイルに書き込む\n",
+        "secrets = {\n",
+        "    \"huggingface\": {\n",
+        "        \"token\": os.environ.get(\"HUGGINGFACE_TOKEN\", \"\")\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "# 設定ファイルを書き込む\n",
+        "with open('.streamlit/secrets.toml', 'w') as f:\n",
+        "    toml.dump(secrets, f)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "fK0vI_xKELSP"
+      },
+      "source": [
+        "アプリを起動します。\n",
+        "\n",
+        "02_streamlit_appでは、Huggingfaceからモデルをダウンロードするため、初回起動には2分程度時間がかかります。\n",
+        "\n",
+        "この待ち時間を利用して、app.pyのコードを確認してみましょう。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 21,
+      "metadata": {
+        "id": "TBQyTTWTELSP",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "9d6230c8-82da-4a7f-9a13-db10234f5be0"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "公開URL: https://74a9-34-125-242-248.ngrok-free.app\n",
+            "\n",
+            "Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.\n",
+            "\u001b[0m\n",
+            "\u001b[0m\n",
+            "\u001b[34m\u001b[1m  You can now view your Streamlit app in your browser.\u001b[0m\n",
+            "\u001b[0m\n",
+            "\u001b[34m  Local URL: \u001b[0m\u001b[1mhttp://localhost:8501\u001b[0m\n",
+            "\u001b[34m  Network URL: \u001b[0m\u001b[1mhttp://172.28.0.12:8501\u001b[0m\n",
+            "\u001b[34m  External URL: \u001b[0m\u001b[1mhttp://34.125.242.248:8501\u001b[0m\n",
+            "\u001b[0m\n",
+            "NLTK loaded successfully.\n",
+            "2025-04-22 17:25:31.268877: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered\n",
+            "WARNING: All log messages before absl::InitializeLog() is called are written to STDERR\n",
+            "E0000 00:00:1745342731.292697    7966 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered\n",
+            "E0000 00:00:1745342731.299855    7966 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered\n",
+            "2025-04-22 17:25:31.331335: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\n",
+            "To enable the following instructions: AVX2 AVX512F FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n",
+            "NLTK Punkt data checked/downloaded.\n",
+            "Database 'chat_feedback.db' initialized successfully.\n",
+            "Loading checkpoint shards: 100% 2/2 [00:00<00:00,  9.41it/s]\n",
+            "Device set to use cuda\n",
+            "2025-04-22 17:25:43.534 Examining the path of torch.classes raised:\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/streamlit/web/bootstrap.py\", line 347, in run\n",
+            "    if asyncio.get_running_loop().is_running():\n",
+            "       ^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "RuntimeError: no running event loop\n",
+            "\n",
+            "During handling of the above exception, another exception occurred:\n",
+            "\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/streamlit/watcher/local_sources_watcher.py\", line 217, in get_module_paths\n",
+            "    potential_paths = extract_paths(module)\n",
+            "                      ^^^^^^^^^^^^^^^^^^^^^\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/streamlit/watcher/local_sources_watcher.py\", line 210, in <lambda>\n",
+            "    lambda m: list(m.__path__._path),\n",
+            "                   ^^^^^^^^^^^^^^^^\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/torch/_classes.py\", line 13, in __getattr__\n",
+            "    proxy = torch._C._get_custom_class_python_wrapper(self.name, attr)\n",
+            "            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "RuntimeError: Tried to instantiate class '__path__._path', but it does not exist! Ensure that it is registered via torch::class_\n",
+            "\u001b[34m  Stopping...\u001b[0m\n",
+            "\u001b[34m  Stopping...\u001b[0m\n",
+            "^C\n"
+          ]
+        }
+      ],
+      "source": [
+        "from pyngrok import ngrok\n",
+        "\n",
+        "public_url = ngrok.connect(8501).public_url\n",
+        "print(f\"公開URL: {public_url}\")\n",
+        "!streamlit run app.py"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "VBrOuWuEawqJ"
+      },
+      "source": [
+        "アプリケーションの機能としては、チャット機能や履歴閲覧があります。\n",
+        "\n",
+        "これらの機能を実現するためには、StreamlitによるUI部分だけではなく、SQLiteを使用したチャット履歴の保存やLLMのモデルを呼び出した推論などの処理を組み合わせることで実現しています。\n",
+        "\n",
+        "- **`app.py`**: アプリケーションのエントリーポイント。チャット機能、履歴閲覧、サンプルデータ管理のUIを提供します。\n",
+        "- **`ui.py`**: チャットページや履歴閲覧ページなど、アプリケーションのUIロジックを管理します。\n",
+        "- **`llm.py`**: LLMモデルのロードとテキスト生成を行うモジュール。\n",
+        "- **`database.py`**: SQLiteデータベースを使用してチャット履歴やフィードバックを保存・管理します。\n",
+        "- **`metrics.py`**: BLEUスコアやコサイン類似度など、回答の評価指標を計算するモジュール。\n",
+        "- **`data.py`**: サンプルデータの作成やデータベースの初期化を行うモジュール。\n",
+        "- **`config.py`**: アプリケーションの設定（モデル名やデータベースファイル名）を管理します。\n",
+        "- **`requirements.txt`**: このアプリケーションを実行するために必要なPythonパッケージ。"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "Xvm8sWFPELSP"
+      },
+      "source": [
+        "後片付けとして、使う必要のないngrokのトンネルを削除します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 22,
+      "metadata": {
+        "id": "WFJC2TmZELSP"
+      },
+      "outputs": [],
+      "source": [
+        "from pyngrok import ngrok\n",
+        "ngrok.kill()"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "rUXhIzV7ELSP"
+      },
+      "source": [
+        "# 03_FastAPI\n",
+        "\n",
+        "ディレクトリ「03_FastAPI」に移動します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 23,
+      "metadata": {
+        "id": "4ejjDLxr3kfC",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "04afca62-bc2d-4c96-9f5d-15741ecacfb4"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "/content/lecture-ai-engineering/day1/03_FastAPI\n"
+          ]
+        }
+      ],
+      "source": [
+        "%cd /content/lecture-ai-engineering/day1/03_FastAPI"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "f45TDsNzELSQ"
+      },
+      "source": [
+        "必要なライブラリをインストールします。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 24,
+      "metadata": {
+        "id": "9uv6glCz5a7Z"
+      },
+      "outputs": [],
+      "source": [
+        "%%capture\n",
+        "!pip install -r requirements.txt"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "JfrmE2VmELSQ"
+      },
+      "source": [
+        "ngrokとhuggigfaceのトークンを使用して、認証を行います。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 25,
+      "metadata": {
+        "id": "ELzWhMFORRIO",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "bbd8dd64-f45e-4c3f-eccf-243b554a5167"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Authtoken saved to configuration file: /root/.config/ngrok/ngrok.yml\n",
+            "The token has not been saved to the git credentials helper. Pass `add_to_git_credential=True` in this function directly or `--add-to-git-credential` if using via `huggingface-cli` if you want to set the git credential as well.\n",
+            "Token is valid (permission: write).\n",
+            "The token `ai_engeneering` has been saved to /root/.cache/huggingface/stored_tokens\n",
+            "Your token has been saved to /root/.cache/huggingface/token\n",
+            "Login successful.\n",
+            "The current active token is: `ai_engeneering`\n"
+          ]
+        }
+      ],
+      "source": [
+        "!ngrok authtoken $$NGROK_TOKEN\n",
+        "!huggingface-cli login --token $$HUGGINGFACE_TOKEN"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "t-wztc2CELSQ"
+      },
+      "source": [
+        "アプリを起動します。\n",
+        "\n",
+        "「02_streamlit_app」から続けて「03_FastAPI」を実行している場合は、モデルのダウンロードが済んでいるため、すぐにサービスが立ち上がります。\n",
+        "\n",
+        "「03_FastAPI」のみを実行している場合は、初回の起動時にモデルのダウンロードが始まるので、モデルのダウンロードが終わるまで数分間待ちましょう。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 28,
+      "metadata": {
+        "id": "meQ4SwISn3IQ",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "outputId": "860f763c-692f-4c34-b02f-31e64b15f3b1"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-04-22 17:35:04.798138: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered\n",
+            "WARNING: All log messages before absl::InitializeLog() is called are written to STDERR\n",
+            "E0000 00:00:1745343304.818348   10502 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered\n",
+            "E0000 00:00:1745343304.824439   10502 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered\n",
+            "2025-04-22 17:35:04.844679: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\n",
+            "To enable the following instructions: AVX2 AVX512F FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n",
+            "モデル名を設定: google/gemma-3-1b-it\n",
+            "/content/lecture-ai-engineering/day1/03_FastAPI/app.py:134: DeprecationWarning: \n",
+            "        on_event is deprecated, use lifespan event handlers instead.\n",
+            "\n",
+            "        Read more about it in the\n",
+            "        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).\n",
+            "        \n",
+            "  @app.on_event(\"startup\")\n",
+            "FastAPIエンドポイントを定義しました。\n",
+            "アクティブなngrokトンネルはありません。\n",
+            "ポート8501に新しいngrokトンネルを開いています...\n",
+            "---------------------------------------------------------------------\n",
+            "✅ 公開URL:   https://477c-34-125-242-248.ngrok-free.app\n",
+            "📖 APIドキュメント (Swagger UI): https://477c-34-125-242-248.ngrok-free.app/docs\n",
+            "---------------------------------------------------------------------\n",
+            "(APIクライアントやブラウザからアクセスするためにこのURLをコピーしてください)\n",
+            "\u001b[32mINFO\u001b[0m:     Started server process [\u001b[36m10502\u001b[0m]\n",
+            "\u001b[32mINFO\u001b[0m:     Waiting for application startup.\n",
+            "load_model_task: モデルの読み込みを開始...\n",
+            "使用デバイス: cuda\n",
+            "config.json: 100% 899/899 [00:00<00:00, 5.70MB/s]\n",
+            "model.safetensors:  62% 1.24G/2.00G [00:09<00:03, 250MB/s]t=2025-04-22T17:35:19+0000 lvl=warn msg=\"failed to open private leg\" id=e1eee0b69d60 privaddr=localhost:8501 err=\"dial tcp 127.0.0.1:8501: connect: connection refused\"\n",
+            "model.safetensors: 100% 2.00G/2.00G [00:12<00:00, 161MB/s]\n",
+            "generation_config.json: 100% 215/215 [00:00<00:00, 1.46MB/s]\n",
+            "tokenizer_config.json: 100% 1.16M/1.16M [00:00<00:00, 5.60MB/s]\n",
+            "tokenizer.model: 100% 4.69M/4.69M [00:00<00:00, 315MB/s]\n",
+            "tokenizer.json: 100% 33.4M/33.4M [00:00<00:00, 300MB/s]\n",
+            "added_tokens.json: 100% 35.0/35.0 [00:00<00:00, 281kB/s]\n",
+            "special_tokens_map.json: 100% 662/662 [00:00<00:00, 3.39MB/s]\n",
+            "t=2025-04-22T17:35:28+0000 lvl=warn msg=\"failed to open private leg\" id=42887fb6e8a0 privaddr=localhost:8501 err=\"dial tcp 127.0.0.1:8501: connect: connection refused\"\n",
+            "Device set to use cuda\n",
+            "モデル 'google/gemma-3-1b-it' の読み込みに成功しました\n",
+            "load_model_task: モデルの読み込みが完了しました。\n",
+            "起動時にモデルの初期化が完了しました。\n",
+            "\u001b[32mINFO\u001b[0m:     Application startup complete.\n",
+            "\u001b[32mINFO\u001b[0m:     Uvicorn running on \u001b[1mhttp://0.0.0.0:8501\u001b[0m (Press CTRL+C to quit)\n",
+            "\u001b[32mINFO\u001b[0m:     126.110.235.27:0 - \"\u001b[1mGET /docs HTTP/1.1\u001b[0m\" \u001b[32m200 OK\u001b[0m\n",
+            "\u001b[32mINFO\u001b[0m:     126.110.235.27:0 - \"\u001b[1mGET /openapi.json HTTP/1.1\u001b[0m\" \u001b[32m200 OK\u001b[0m\n",
+            "\u001b[32mINFO\u001b[0m:     Shutting down\n",
+            "\u001b[32mINFO\u001b[0m:     Waiting for application shutdown.\n",
+            "\u001b[32mINFO\u001b[0m:     Application shutdown complete.\n",
+            "\u001b[32mINFO\u001b[0m:     Finished server process [\u001b[36m10502\u001b[0m]\n",
+            "\n",
+            "サーバープロセスが終了しました。\n",
+            "Task exception was never retrieved\n",
+            "future: <Task finished name='Task-1' coro=<Server.serve() done, defined at /usr/local/lib/python3.11/dist-packages/uvicorn/server.py:68> exception=KeyboardInterrupt()>\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/uvicorn/main.py\", line 580, in run\n",
+            "    server.run()\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/uvicorn/server.py\", line 66, in run\n",
+            "    return asyncio.run(self.serve(sockets=sockets))\n",
+            "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/nest_asyncio.py\", line 30, in run\n",
+            "    return loop.run_until_complete(task)\n",
+            "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/nest_asyncio.py\", line 92, in run_until_complete\n",
+            "    self._run_once()\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/nest_asyncio.py\", line 133, in _run_once\n",
+            "    handle._run()\n",
+            "  File \"/usr/lib/python3.11/asyncio/events.py\", line 84, in _run\n",
+            "    self._context.run(self._callback, *self._args)\n",
+            "  File \"/usr/lib/python3.11/asyncio/tasks.py\", line 360, in __wakeup\n",
+            "    self.__step()\n",
+            "  File \"/usr/lib/python3.11/asyncio/tasks.py\", line 277, in __step\n",
+            "    result = coro.send(None)\n",
+            "             ^^^^^^^^^^^^^^^\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/uvicorn/server.py\", line 69, in serve\n",
+            "    with self.capture_signals():\n",
+            "  File \"/usr/lib/python3.11/contextlib.py\", line 144, in __exit__\n",
+            "    next(self.gen)\n",
+            "  File \"/usr/local/lib/python3.11/dist-packages/uvicorn/server.py\", line 330, in capture_signals\n",
+            "    signal.raise_signal(captured_signal)\n",
+            "KeyboardInterrupt\n"
+          ]
+        }
+      ],
+      "source": [
+        "!python app.py"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "RLubjIhbELSR"
+      },
+      "source": [
+        "FastAPIが起動すると、APIとクライアントが通信するためのURL（エンドポイント）が作られます。\n",
+        "\n",
+        "URLが作られるのと合わせて、Swagger UIというWebインターフェースが作られます。\n",
+        "\n",
+        "Swagger UIにアクセスすることで、APIの仕様を確認できたり、APIをテストすることができます。\n",
+        "\n",
+        "Swagger UIを利用することで、APIを通してLLMを動かしてみましょう。"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "XgumW3mGELSR"
+      },
+      "source": [
+        "後片付けとして、使う必要のないngrokのトンネルを削除します。"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 29,
+      "metadata": {
+        "id": "RJymTZio-WPJ"
+      },
+      "outputs": [],
+      "source": [
+        "from pyngrok import ngrok\n",
+        "ngrok.kill()"
+      ]
+    }
+  ],
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "gpuType": "T4"
+    },
+    "kernelspec": {
+      "display_name": "Python 3",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "accelerator": "GPU"
+  },
+  "nbformat": 4,
+  "nbformat_minor": 0
+}
