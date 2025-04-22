@@ -10,7 +10,7 @@ from metrics import get_metrics_descriptions
 # --- チャットページのUI ---
 def display_chat_page(pipe):
     """チャットページのUIを表示する"""
-    st.subheader("質問を入力してください")
+    st.subheader("Input question")
     user_question = st.text_area("質問", key="question_input", height=100, value=st.session_state.get("current_question", ""))
     submit_button = st.button("質問を送信")
 
