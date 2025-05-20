@@ -19,16 +19,16 @@ def test_data():
     df = pd.read_csv(data_path)
     # 前処理（モデルの学習時と同じ形式にする）
     X = df.drop(["Survived", "Name", "Ticket", "Cabin"], axis=1)
-    
+
     # 数値型カラムと文字列型カラムを分けて処理
     numeric_cols = X.select_dtypes(include=["number"]).columns
     X[numeric_cols] = X[numeric_cols].fillna(X[numeric_cols].mean())
-    
+
     # 文字列型カラムは最頻値で埋める
     categorical_cols = X.select_dtypes(exclude=["number"]).columns
     for col in categorical_cols:
         X[col] = X[col].fillna(X[col].mode()[0])
-    
+
     return X.head(100)  # テスト用に100サンプルを使用
 
 
