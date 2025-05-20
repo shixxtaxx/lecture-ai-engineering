@@ -17,9 +17,9 @@ def test_data():
     # テスト用のサンプルデータを作成
     data_path = Path("day5/演習3/data/Titanic.csv")
     df = pd.read_csv(data_path)
-    # 前処理（実際のプロジェクトに合わせて調整が必要）
+    # 前処理（モデルの学習時と同じ形式にする）
     X = df.drop(["Survived", "Name", "Ticket", "Cabin"], axis=1)
-    X = pd.get_dummies(X, columns=["Sex", "Embarked"], drop_first=True)
+    # ダミー変数化せずに元のカラムを保持
     X = X.fillna(X.mean())
     return X.head(100)  # テスト用に100サンプルを使用
 
